@@ -79,7 +79,7 @@ const unsigned char epd_bitmap_1[] PROGMEM = {
 // --- Sensor MAX30105 ---
 MAX30105 particleSensor;
 
-const byte RATE_SIZE = 2;
+const byte RATE_SIZE = 5;
 byte rates[RATE_SIZE];
 byte rateSpot = 0;
 long lastBeat = 0;
@@ -91,13 +91,17 @@ int previousBPM = 0;
 unsigned long lastUpdateTime = 0;
 const unsigned long stabilizationInterval = 5000;
 
-const int minValidMeasurements = 5;
+const int minValidMeasurements = 3;
 int validMeasurements = 0;
 
 bool dedoPresente = false;
 const int umbralIR = 60000;
 const int tiempoConfirmacionDedo = 2000;
 unsigned long tiempoUltimaConfirmacion = 0;
+// Nuevas variables que debes agregar globalmente si aún no están:
+unsigned long tiempoInicioProcesamiento = 0;
+const unsigned long tiempoMaximoProcesamiento = 5000; // 5 segundos
+String mensajeAnterior = "";
 
 // --- WiFi ---
 const char *WiFi_SSID = "Suazo";
@@ -111,43 +115,22 @@ FirebaseAuth auth;
 FirebaseConfig config;
 unsigned long sendDataPrevMillis = 0;
 bool signupOk = false;
-
+long irValue;
 // --- Prototipos ---
 void mostrarMensaje(String mensaje);
 int calcularPromedioBPM();
 void mostrarBPM(int bpm);
 void detectarDispositivosI2C();
 void resetI2CPins();
+void SendDataFB(int BPM);
+int StableBPM(long IrValue);
+void ConfigFB();
+void reconectarWiFi();
 
 void setup()
 {
-  Serial.begin(115200);
-  WiFi.begin(WiFi_SSID, PASSWORD);
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(1000);
-    Serial.println("Conectando a WiFi...");
-  }
-  Serial.println("\nConexión establecida");
-  Serial.print("Dirección IP: ");
-  Serial.println(WiFi.localIP());
-
-  config.api_key = API_WEB_KEY;
-  config.database_url = DB_URL;
-
-  if (Firebase.signUp(&config, &auth, "", ""))
-  {
-    Serial.println("Firebase SignUp OK");
-    signupOk = true;
-  }
-  else
-  {
-    Serial.println(config.signer.signupError.message.c_str());
-  }
-
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-  Serial.println("sistemaConectado");
+  
+  ConfigFB();
 
   Wire.begin(21, 22);
   detectarDispositivosI2C();
@@ -175,95 +158,142 @@ void setup()
 
 void loop()
 {
-  long irValue = particleSensor.getIR();
-  delay(5);
+  reconectarWiFi();
+  irValue = particleSensor.getIR();
+  // Serial.print("IR Value: ");
+  // Serial.println(irValue);
+  int stableBPM = StableBPM(irValue);
 
-  if (irValue >= umbralIR)
+  
+
+  
+
+ 
+}
+
+
+void ConfigFB(){
+  Serial.begin(115200);
+  WiFi.begin(WiFi_SSID, PASSWORD);
+  while (WiFi.status() != WL_CONNECTED)
   {
-    if (!dedoPresente && (millis() - tiempoUltimaConfirmacion > tiempoConfirmacionDedo))
-    {
-      dedoPresente = true;
-      Serial.println("Dedo detectado");
-    }
+    delay(1000);
+    Serial.println("Conectando a WiFi...");
+  }
+  Serial.println("\nConexión establecida");
+  Serial.println(WiFi.localIP());
+
+  config.api_key = API_WEB_KEY;
+  config.database_url = DB_URL;
+
+  if (Firebase.signUp(&config, &auth, "", ""))
+  {
+    Serial.println("Firebase SignUp OK");
+    signupOk = true;
   }
   else
   {
-    if (dedoPresente)
-      Serial.println("Dedo removido");
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  Serial.println("sistemaConectado");
+}
+
+int StableBPM(long irValue) {
+  if (irValue >= umbralIR) {
+    if (!dedoPresente && (millis() - tiempoUltimaConfirmacion > tiempoConfirmacionDedo)) {
+      dedoPresente = true;
+      Serial.println("Dedo detectado");
+      mostrarMensaje("Procesando...");
+      // No necesitamos tiempoInicioProcesamiento aquí
+    }
+  } else {
+    if (dedoPresente) Serial.println("Dedo removido");
+
+    // Reiniciar variables
     dedoPresente = false;
     tiempoUltimaConfirmacion = millis();
     mostrarMensaje("Ubique su dedo");
-    stableBPM = 0;
+
+    stableBPM = -1;
+    beatAvg = 0;
     validMeasurements = 0;
-    return;
+    rateSpot = 0;
+    for (byte i = 0; i < RATE_SIZE; i++) rates[i] = 0;
+
+    return -1;
   }
 
-  if (dedoPresente && checkForBeat(irValue))
-  {
+  if (dedoPresente && checkForBeat(irValue)) {
     long delta = millis() - lastBeat;
     lastBeat = millis();
     beatsPerMinute = 60 / (delta / 1000.0);
 
-    if (beatsPerMinute < 255 && beatsPerMinute > 20)
-    {
+    if (beatsPerMinute >= 45 && beatsPerMinute <= 190) {
       rates[rateSpot++] = (byte)beatsPerMinute;
       rateSpot %= RATE_SIZE;
 
-      if (validMeasurements < minValidMeasurements)
-      {
-        if (beatsPerMinute >= 50 && beatsPerMinute <= 180)
-        {
-          validMeasurements++;
+      validMeasurements++;
+
+      if (validMeasurements >= minValidMeasurements) {
+        beatAvg = calcularPromedioBPM();
+
+        unsigned long currentTime = millis();
+        if (currentTime - lastUpdateTime >= stabilizationInterval) {
+          stableBPM = beatAvg;
+
+          if (abs(stableBPM - previousBPM) >= 1) {
+            previousBPM = stableBPM;
+            lastUpdateTime = currentTime;
+            mostrarBPM(stableBPM);
+          }
+          
+          if(stableBPM != -1) SendDataFB(stableBPM);
+          return stableBPM;
         }
       }
-
-      if (validMeasurements >= minValidMeasurements)
-      {
-        beatAvg = calcularPromedioBPM();
-      }
     }
+    
   }
 
-  if (validMeasurements >= minValidMeasurements)
-  {
-    unsigned long currentTime = millis();
-    if (currentTime - lastUpdateTime >= stabilizationInterval && beatAvg != 0)
-    {
-      stableBPM = beatAvg;
+  return -1;  // Aún no hay BPM confiable
+}
 
-      if (abs(stableBPM - previousBPM) >= 1)
-      {
-        previousBPM = stableBPM;
-        lastUpdateTime = currentTime;
-        mostrarBPM(stableBPM);
-      }
-    }
-  }
 
-  if (Firebase.ready() && signupOk && (millis() - sendDataPrevMillis > 5000 || sendDataPrevMillis == 0))
+
+
+void SendDataFB(int BPM){
+   if (Firebase.ready() && signupOk && (millis() - sendDataPrevMillis > 5000 || sendDataPrevMillis == 0))
   {
     sendDataPrevMillis = millis();
-    if (Firebase.RTDB.setInt(&fbdo, "BPM", stableBPM))
+    if (Firebase.RTDB.setInt(&fbdo, "BPM", BPM))
     {
       Serial.println("Datos enviados a Firebase.");
-      mostrarBPM(stableBPM);
     }
     else
     {
       Serial.println(fbdo.errorReason());
     }
   }
+  
 }
 
-void mostrarMensaje(String mensaje)
-{
-  Serial.println(mensaje);
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(10, 60);
-  tft.print(mensaje);
+
+void mostrarMensaje(String mensaje) {
+  if (mensaje != mensajeAnterior) {
+    mensajeAnterior = mensaje;
+
+    Serial.println(mensaje);
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setTextSize(2);  // Tamaño más legible
+    tft.setCursor(10, 60);
+    tft.print(mensaje);
+  }
 }
+
 
 void mostrarBPM(int bpm)
 {
@@ -279,15 +309,21 @@ void mostrarBPM(int bpm)
   tft.println(bpm);
 }
 
-int calcularPromedioBPM()
-{
+int calcularPromedioBPM() {
   int sumaBPM = 0;
-  for (byte i = 0; i < RATE_SIZE; i++)
-  {
-    sumaBPM += rates[i];
+  int conteo = 0;
+
+  for (byte i = 0; i < RATE_SIZE; i++) {
+    if (rates[i] >= 50 && rates[i] <= 180) {
+      sumaBPM += rates[i];
+      conteo++;
+    }
   }
-  return sumaBPM / RATE_SIZE;
+
+  if (conteo == 0) return 0;
+  return sumaBPM / conteo;
 }
+
 
 void detectarDispositivosI2C()
 {
@@ -333,3 +369,32 @@ void resetI2CPins()
   Wire.begin();
   Serial.println("Bus I2C reiniciado manualmente");
 }
+
+
+void reconectarWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi desconectado. Intentando reconectar...");
+    WiFi.disconnect();
+    WiFi.begin(WiFi_SSID, PASSWORD);
+
+    unsigned long tiempoInicio = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - tiempoInicio < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nReconexión exitosa.");
+      
+      // 🔁 Re-inicializar Firebase u otro servicio seguro si es necesario
+      // firebaseReconnect();
+    } else {
+      Serial.println("\nNo se pudo reconectar.");
+    }
+  }
+}
+
+
+
+
+//2105
