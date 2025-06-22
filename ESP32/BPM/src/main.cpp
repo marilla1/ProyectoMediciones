@@ -206,7 +206,8 @@ int StableBPM(long irValue) {
     if (!dedoPresente && (millis() - tiempoUltimaConfirmacion > tiempoConfirmacionDedo)) {
       dedoPresente = true;
       Serial.println("Dedo detectado");
-      mostrarMensaje("Procesando...");
+      
+      mostrarMensaje("Espere...");
       // No necesitamos tiempoInicioProcesamiento aquí
     }
   } else {
